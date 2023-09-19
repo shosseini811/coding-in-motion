@@ -4,6 +4,7 @@ import requests
 import json
 import sqlite3
 from config import config
+from confluent_kafka import Producer
 
 DATABASE_FILE = "videos.db"
 
@@ -86,6 +87,9 @@ def store_video_in_sqlite(video):
 def main():
     logging.info("START")
 
+    kafka_config = config["kafka"]
+    producer = Producer(kafka_config)
+
     google_api_key = config["google_api_key"]
     youtube_playlist_id = config["youtube_playlist_id"]
 
@@ -94,7 +98,18 @@ def main():
         for video in fetch_videos(google_api_key, video_id):
             summarized_video = summarize_video(video)
             logging.info("GOT %s", summarized_video)
+
+            # Send data to Kafka
+            producer.produce(
+                topic="youtube_videos",
+                key=video_id,
+                value=json.dumps(summarized_video),
+            )
+
+            # Store in SQLite
             store_video_in_sqlite(summarized_video)
+
+    producer.flush()
 
 
 if __name__ == "__main__":
