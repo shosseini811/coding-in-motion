@@ -2,13 +2,12 @@ import logging
 import sys
 import requests
 import json
-import sqlite3
 from config import config
 from confluent_kafka import Producer
 
-DATABASE_FILE = "videos.db"
+KSQL_URL = "http://localhost:8088"  # Default KSQL REST API endpoint
 
-
+# Existing YouTube fetching functions
 def fetch_playlist_items_page(google_api_key, youtube_playlist_id, page_token=None):
     response = requests.get("https://www.googleapis.com/youtube/v3/playlistItems",
                             params={
@@ -18,10 +17,7 @@ def fetch_playlist_items_page(google_api_key, youtube_playlist_id, page_token=No
                                 "pageToken": page_token
                             })
 
-    payload = json.loads(response.text)
-    logging.debug("GOT %s", payload)
-    return payload
-
+    return response.json()
 
 def fetch_videos_page(google_api_key, video_id, page_token=None):
     response = requests.get("https://www.googleapis.com/youtube/v3/videos",
@@ -32,28 +28,25 @@ def fetch_videos_page(google_api_key, video_id, page_token=None):
                                 "pageToken": page_token
                             })
 
-    payload = json.loads(response.text)
-    logging.debug("GOT %s", payload)
-    return payload
+    return response.json()
 
+def fetch_playlist_items(google_api_key, youtube_playlist_id):
+    page_token = None
+    while True:
+        payload = fetch_playlist_items_page(google_api_key, youtube_playlist_id, page_token)
+        yield from payload["items"]
+        page_token = payload.get("nextPageToken")
+        if not page_token:
+            break
 
-def fetch_playlist_items(google_api_key, youtube_playlist_id, page_token=None):
-    payload = fetch_playlist_items_page(google_api_key, youtube_playlist_id, page_token)
-    yield from payload["items"]
-
-    next_page_token = payload.get("nextPageToken")
-    if next_page_token is not None:
-        yield from fetch_playlist_items(google_api_key, youtube_playlist_id, next_page_token)
-
-
-def fetch_videos(google_api_key, video_id, page_token=None):
-    payload = fetch_videos_page(google_api_key, video_id, page_token)
-    yield from payload["items"]
-
-    next_page_token = payload.get("nextPageToken")
-    if next_page_token is not None:
-        yield from fetch_videos(google_api_key, video_id, next_page_token)
-
+def fetch_videos(google_api_key, video_id):
+    page_token = None
+    while True:
+        payload = fetch_videos_page(google_api_key, video_id, page_token)
+        yield from payload["items"]
+        page_token = payload.get("nextPageToken")
+        if not page_token:
+            break
 
 def summarize_video(video):
     return {
@@ -64,25 +57,33 @@ def summarize_video(video):
         "comments": int(video["statistics"].get("commentCount", 0)),
     }
 
+def send_ksql_command(command):
+    headers = {
+        "Content-Type": "application/vnd.ksql.v1+json",
+        "Accept": "application/vnd.ksql.v1+json",
+    }
+    payload = {
+        "ksql": command,
+        "streamsProperties": {}
+    }
+    response = requests.post(f"{KSQL_URL}/ksql", headers=headers, json=payload)
+    return response.json()
 
-def store_video_in_sqlite(video):
-    with sqlite3.connect(DATABASE_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS videos (
-                video_id TEXT PRIMARY KEY,
-                title TEXT,
-                views INTEGER,
-                likes INTEGER,
-                comments INTEGER
-            )
-        """)
-
-        cursor.execute("""
-            INSERT OR REPLACE INTO videos (video_id, title, views, likes, comments)
-            VALUES (?, ?, ?, ?, ?)
-        """, (video["video_id"], video["title"], video["views"], video["likes"], video["comments"]))
-
+def setup_ksql_stream():
+    command = """
+    CREATE STREAM IF NOT EXISTS youtube_videos_stream (
+        video_id VARCHAR PRIMARY KEY,
+        title VARCHAR,
+        views BIGINT,
+        likes BIGINT,
+        comments BIGINT
+    ) WITH (
+        KAFKA_TOPIC='youtube_videos',
+        VALUE_FORMAT='JSON',
+        KEY='video_id'
+    );
+    """
+    return send_ksql_command(command)
 
 def main():
     logging.info("START")
@@ -106,11 +107,12 @@ def main():
                 value=json.dumps(summarized_video),
             )
 
-            # Store in SQLite
-            store_video_in_sqlite(summarized_video)
-
     producer.flush()
 
+    # After producing data to Kafka, set up KSQL stream
+    setup_ksql_stream()
+
+    # You can then send more KSQL commands to query or transform the data as required
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
