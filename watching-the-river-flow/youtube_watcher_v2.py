@@ -100,6 +100,13 @@ def main():
             summarized_video = summarize_video(video)
             logging.info("GOT %s", summarized_video)
 
+            def delivery_report(err, msg):
+                """ Called once for each message produced to indicate delivery result. """
+                if err is not None:
+                    logging.error('Message delivery failed: {}'.format(err))
+                else:
+                    logging.info('Message delivered to {} [{}]'.format(msg.topic(), msg.partition()))
+
             # Send data to Kafka
             producer.produce(
                 topic="youtube_videos",
