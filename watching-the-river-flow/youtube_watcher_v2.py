@@ -2,8 +2,10 @@ import logging
 import sys
 import requests
 import json
-from config import config
+from config import GOOGLE_API_KEY, YOUTUBE_PLAYLIST_ID, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 from confluent_kafka import Producer
+
+
 
 KSQL_URL = "http://localhost:8088"  # Default KSQL REST API endpoint
 
@@ -30,6 +32,7 @@ def fetch_videos_page(google_api_key, video_id, page_token=None):
 
     return response.json()
 
+# Fetch all videos in a playlist
 def fetch_playlist_items(google_api_key, youtube_playlist_id):
     page_token = None
     while True:
@@ -48,6 +51,7 @@ def fetch_videos(google_api_key, video_id):
         if not page_token:
             break
 
+# Summarize the video data
 def summarize_video(video):
     return {
         "video_id": video["id"],
@@ -57,6 +61,7 @@ def summarize_video(video):
         "comments": int(video["statistics"].get("commentCount", 0)),
     }
 
+# Send a KSQL command to the KSQL REST API
 def send_ksql_command(command):
     headers = {
         "Content-Type": "application/vnd.ksql.v1+json",
@@ -85,39 +90,48 @@ def setup_ksql_stream():
     """
     return send_ksql_command(command)
 
+def send_telegram_message(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message
+    }
+    requests.post(url, json=payload)
+
+
+import time
+
 def main():
     logging.info("START")
+    producer = Producer({'bootstrap.servers': 'localhost:9092'})
 
-    kafka_config = config["kafka"]
-    producer = Producer(kafka_config)
+    processed_video_ids = set()  # Set to keep track of processed video IDs
 
-    google_api_key = config["google_api_key"]
-    youtube_playlist_id = config["youtube_playlist_id"]
+    while True:  # Infinite loop to keep checking for new videos
+        for video_item in fetch_playlist_items(GOOGLE_API_KEY, YOUTUBE_PLAYLIST_ID):
+            video_id = video_item["contentDetails"]["videoId"]
 
-    for video_item in fetch_playlist_items(google_api_key, youtube_playlist_id):
-        video_id = video_item["contentDetails"]["videoId"]
-        for video in fetch_videos(google_api_key, video_id):
-            summarized_video = summarize_video(video)
-            logging.info("GOT %s", summarized_video)
+            # Skip the video if it has already been processed
+            if video_id in processed_video_ids:
+                continue
 
-            def delivery_report(err, msg):
-                """ Called once for each message produced to indicate delivery result. """
-                if err is not None:
-                    logging.error('Message delivery failed: {}'.format(err))
-                else:
-                    logging.info('Message delivered to {} [{}]'.format(msg.topic(), msg.partition()))
+            for video in fetch_videos(GOOGLE_API_KEY, video_id):
+                summarized_video = summarize_video(video)
+                logging.info("GOT %s", summarized_video)
 
-            # Send data to Kafka
-            producer.produce(
-                topic="youtube_videos",
-                key=video_id,
-                value=json.dumps(summarized_video),
-            )
+                send_telegram_message(f"New video detected: {summarized_video}")
 
-    producer.flush()
+                producer.produce(
+                    topic="youtube_videos",
+                    key=video_id,
+                    value=json.dumps(summarized_video),
+                )
 
-    # After producing data to Kafka, set up KSQL stream
-    setup_ksql_stream()
+            processed_video_ids.add(video_id)  # Add the video ID to the processed set
+
+        producer.flush()
+        setup_ksql_stream()
+        time.sleep(1)  # Sleep for 1 second before the next iteration
 
     # You can then send more KSQL commands to query or transform the data as required
 
